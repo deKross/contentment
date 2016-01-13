@@ -3,13 +3,16 @@
 from itertools import chain
 
 from bson import ObjectId
-from mongoengine import QuerySet, Q
+from mongoengine import QuerySet, Q, DictField, MapField
 from mongoengine import Document, ListField, StringField, IntField, ObjectIdField
-from mongoengine import ReferenceField
+from mongoengine import ReferenceField as BaseReferenceField
+from mongoengine.connection import get_db
 from mongoengine.signals import pre_delete
 from mongoengine.common import _import_class
 from mongoengine.base.fields import ComplexBaseField
 from mongoengine.base.datastructures import EmbeddedDocumentList, BaseList, BaseDict
+
+from web.ext.contentment import ContentmentCache
 
 from .util.model import signal
 
@@ -27,6 +30,21 @@ from mongoengine.dereference import DeReference
 from mongoengine.base import get_document, TopLevelDocumentMetaclass
 
 
+def get_from_cache(getter, model_id):
+	cache = ContentmentCache.get_cache()
+
+	if cache is None:
+		return getter()
+
+	try:
+		entry = cache[model_id]
+	except KeyError:
+		entry = getter()
+		cache[model_id] = entry
+
+	return entry
+
+
 class CustomDereference(DeReference):
 	def _find_references(self, items, depth=0, finded_ids=None):
 		"""
@@ -35,8 +53,7 @@ class CustomDereference(DeReference):
 		:param items: The iterable (dict, list, queryset)
 		:param depth: The current depth of recursion
 		"""
-		# if items and isinstance(items, list) and getattr(items[0], 'name', '') == 'child2':
-		# 	import pudb; pudb.set_trace()
+
 		reference_map = {}
 		if not items or depth >= self.max_depth:
 			return reference_map
@@ -88,6 +105,86 @@ class CustomDereference(DeReference):
 
 		return reference_map
 
+	def _fetch_objects(self, doc_type=None):
+		"""Fetch all references and convert to their document objects
+		"""
+		cache = ContentmentCache.get_cache()
+
+		object_map = {}
+		for collection, dbrefs in self.reference_map.items():
+			cached = set(dbref for dbref in dbrefs if str(dbref) in (cache or {}))
+			if hasattr(collection, 'objects'):  # We have a document class for the refs
+				col_name = collection._get_collection_name()
+				refs = [dbref for dbref in dbrefs
+						if ((col_name, dbref) not in object_map and dbref not in cached)]
+				references = collection.objects.in_bulk(refs)
+				for key, doc in references.items():
+					object_map[(col_name, key)] = doc
+					if cache is not None:
+						cache[str(key)] = doc
+				for dbref in cached:
+					object_map[(col_name, dbref)] = cache[str(dbref)]
+			else:  # Generic reference: use the refs data to convert to document
+				if isinstance(doc_type, (ListField, DictField, MapField)):
+					continue
+
+				refs = [dbref for dbref in dbrefs
+						if (collection, dbref) not in object_map and dbref not in cached]
+
+				if doc_type:
+					references = doc_type._get_db()[collection].find({'_id': {'$in': refs}})
+					for ref in references:
+						doc = doc_type._from_son(ref)
+						object_map[(collection, doc.id)] = doc
+						if cache is not None:
+							cache[str(doc.id)] = doc
+				else:
+					references = get_db()[collection].find({'_id': {'$in': refs}})
+					for ref in references:
+						if '_cls' in ref:
+							doc = get_document(ref["_cls"])._from_son(ref)
+						elif doc_type is None:
+							doc = get_document(
+								''.join(x.capitalize()
+										for x in collection.split('_')))._from_son(ref)
+						else:
+							doc = doc_type._from_son(ref)
+						object_map[(collection, doc.id)] = doc
+						if cache is not None:
+							cache[str(doc.id)] = doc
+				for dbref in cached:
+					object_map[(collection, dbref)] = cache[str(dbref)]
+		return object_map
+
+
+class ReferenceField(BaseReferenceField):
+	def __get__(self, instance, owner):
+		"""Descriptor to allow lazy dereferencing.
+		"""
+		if instance is None:
+			# Document class being used rather than a document object
+			return self
+
+		# Get value from document instance if available
+		value = instance._data.get(self.name)
+		self._auto_dereference = instance._fields[self.name]._auto_dereference
+		# Dereference DBRefs
+		if self._auto_dereference and isinstance(value, DBRef):
+			if hasattr(value, 'cls'):
+				# Dereference using the class type specified in the reference
+				cls = get_document(value.cls)
+			else:
+				cls = self.document_type
+
+			def get_model():
+				data = cls._get_db().dereference(value)
+				if data is not None:
+					return cls._from_son(data)
+
+			instance._data[self.name] = get_from_cache(get_model, str(getattr(value, 'id')))
+
+		return super(ReferenceField, self).__get__(instance, owner)
+
 
 class TaxonomyQuerySet(QuerySet):
 	def __init__(self, document, collection, _rewrite_initial=False):
@@ -95,6 +192,11 @@ class TaxonomyQuerySet(QuerySet):
 		self.__dereference = None
 		if _rewrite_initial:
 			self._initial_query = {'_cls': {'$in': Taxonomy._subclasses}}
+
+	@property
+	def _cursor(self):
+		print("Cursor")
+		return super(TaxonomyQuerySet, self)._cursor
 
 	@property
 	def _dereference(self):
@@ -299,8 +401,17 @@ class TaxonomyQuerySet(QuerySet):
 	@property
 	def children(self):
 		"""Yield all direct children of this asset."""
-
-		return self.base_query(parent__in=self.clone()).order_by('parent', 'order')
+		cache = ContentmentCache.get_cache()
+		pks = set(pk for pk in self.clone().scalar('pk'))
+		found = [doc for doc in cache.values() if doc.parent and doc.parent.pk in pks]
+		for f in found:
+			print('From cache: %s' % f)
+		from_db = self.base_query(parent__in=self.clone(), id__nin=[e.id for e in found])#.order_by('parent', 'order')
+		if cache is not None:
+			for doc in from_db:
+				cache[str(doc.id)] = doc
+		found.extend(from_db)
+		return sorted(found, key=lambda it: (str(it.parent.id) if it.parent else '', it.order))
 
 	@property
 	def contents(self):
@@ -409,6 +520,11 @@ class TaxonomyQuerySet(QuerySet):
 				obj.insert(-1, child)
 		return self
 
+	def get(self, *q_objs, **query):
+		model_id = str(query['id'])
+		getter = lambda: super(TaxonomyQuerySet, self).get(*q_objs, **query)
+		return get_from_cache(getter, model_id)
+
 
 class CustomDereferenceMixin(ComplexBaseField):
 	def __get__(self, instance, owner):
@@ -498,7 +614,7 @@ class Taxonomy(Document):
 		if not hasattr(self, '__objects'):
 			self.__objects = self.tqs
 		return self.__objects
-	
+
 	@property
 	def tqs(self):
 		return TaxonomyQuerySet(self.__class__, self._get_collection(), _rewrite_initial=True)

@@ -14,7 +14,7 @@ from web.ext.template import TemplateExtension
 from web.ext.cast import CastExtension
 from web.ext.local import ThreadLocalExtension
 from web.ext.mongodb.mongoengine import MongoEngineExtension
-from web.ext.contentment import ContentmentExtension
+from web.ext.contentment import ContentmentExtension, AssetCacheExtension
 
 from web.contentment.controller import ContentmentRoot
 
@@ -65,7 +65,8 @@ app = Application(
 				CastExtension(),
 				MongoEngineExtension(uri="mongodb://localhost/contentment"),
 				ContentmentExtension(),
-				ThreadLocalExtension()
+				ThreadLocalExtension(),
+				AssetCacheExtension(),
 			]
 	)
 

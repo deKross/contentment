@@ -36,3 +36,26 @@ class ContentmentExtension:
 	
 	def prepare(self, context):
 		context.domain, _, _ = context.request.host.partition(':')
+
+
+class ContentmentCache(dict):
+	@classmethod
+	def get_cache(cls):
+		import web.core
+		try:
+			return web.core.local.asset_cache
+		except AttributeError:
+			return None
+
+	def __getitem__(self, key):
+		result = super().__getitem__(key)
+		print('From cache: %s' % result)
+		return result
+
+
+class AssetCacheExtension:
+	needs = ['threadlocal']
+
+	def before(self, context):
+		from web.core import local
+		local.asset_cache = ContentmentCache()
