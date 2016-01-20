@@ -45,6 +45,10 @@ def get_from_cache(getter, model_id):
 	return entry
 
 
+def process_assets(assets):
+	return sorted(assets, key=lambda it: (str(it.parent.id) if it.parent else '', it.order))
+
+
 class CustomDereference(DeReference):
 	def _find_references(self, items, depth=0, finded_ids=None):
 		"""
@@ -193,10 +197,28 @@ class TaxonomyQuerySet(QuerySet):
 		if _rewrite_initial:
 			self._initial_query = {'_cls': {'$in': Taxonomy._subclasses}}
 
-	@property
-	def _cursor(self):
-		print("Cursor")
-		return super(TaxonomyQuerySet, self)._cursor
+	# @property
+	# def _cursor(self):
+	# 	print("Cursor")
+	# 	return super(TaxonomyQuerySet, self)._cursor
+
+	def _get_from_db(self, assets, fn, exclude=None, order=('parent', 'order')):
+		from operator import __or__
+		from functools import reduce
+
+		query = [fn(asset) for asset in assets]
+
+		# for asset in assets:#.no_dereference():
+		# 	query.append(Q(parent=asset.parent, pk__ne=asset.pk))
+
+		if not query:  # TODO: Armour everywhere.
+			return []
+
+		query = reduce(__or__, query)
+		if exclude:
+			query &= Q(id__nin=exclude)
+
+		return self.base_query(query).order_by(*(order if isinstance(order, (list, tuple)) else [order]))
 
 	@property
 	def _dereference(self):
@@ -402,88 +424,163 @@ class TaxonomyQuerySet(QuerySet):
 	def children(self):
 		"""Yield all direct children of this asset."""
 		cache = ContentmentCache.get_cache()
+		if cache is None:
+			return self.base_query(parent__in=self.clone()).order_by('parent', 'order')
 		pks = set(pk for pk in self.clone().scalar('pk'))
 		found = [doc for doc in cache.values() if doc.parent and doc.parent.pk in pks]
-		for f in found:
-			print('From cache: %s' % f)
-		from_db = self.base_query(parent__in=self.clone(), id__nin=[e.id for e in found])#.order_by('parent', 'order')
-		if cache is not None:
-			for doc in from_db:
-				cache[str(doc.id)] = doc
-		found.extend(from_db)
-		return sorted(found, key=lambda it: (str(it.parent.id) if it.parent else '', it.order))
+		invalid = any(pk not in cache.children_calculated for pk in pks)
+		if invalid:
+			from_db = self.base_query(parent__in=self.clone(), id__nin=[e.id for e in found])#.order_by('parent', 'order')
+			if cache is not None:
+				for doc in from_db:
+					cache[str(doc.id)] = doc
+					cache.children_calculated.add(doc.parent.id)
+			found.extend(from_db)
+		return process_assets(found)
 
 	@property
 	def contents(self):
 		"""Yield all descendants of this asset."""
-
-		return self.base_query(parents__in=self.clone().all()).order_by('parent', 'order')
+		cache = ContentmentCache.get_cache()
+		if cache is None:
+			return self.base_query(parents__in=self.clone().all()).order_by('parent', 'order')
+		pks = {pk for pk in self.clone().scalar('pk')}
+		found = [doc for doc in cache.values() if doc.parents and ({p.pk for p in doc.parents} & pks)]
+		invalid = any(pk not in cache.contents_calculated for pk in pks)
+		if invalid:
+			from_db = self.base_query(parents__in=self.clone().all(), id__nin=[e.pk for e in found])#.order_by('parent', 'order')
+			print('From DB: %s' % len(from_db))
+			if cache is not None:
+				for doc in from_db:
+					cache[str(doc.pk)] = doc
+					cache.contents_calculated.add(doc.parent.pk)
+			found.extend(from_db)
+			cache.contents_calculated |= pks
+		return process_assets(found)
 
 	@property
 	def siblings(self):
 		"""All siblings of the currently selected assets, not including these assets."""
-		from operator import __or__
-		from functools import reduce
+		cache = ContentmentCache.get_cache()
+		assets = self.clone()
+		filter_fn = lambda asset: Q(parent=asset.parent, pk__ne=asset.pk)
 
-		query = []
+		if cache is None:
+			return self._get_from_db(assets, filter_fn)
 
-		for id, parent in self.clone().scalar('id', 'parent'):#.no_dereference():
-			query.append(Q(parent=parent, id__ne=id))
+		pks = set()
+		parents = set()
+		for asset in assets:
+			pks.add(asset.pk)
+			if asset.parent:
+				parents.add(asset.parent.pk)
+		found = [doc for doc in cache.values() if doc.parent and doc.pk not in pks and doc.parent.pk in parents]
+		invalid = any(pk not in cache.children_calculated for pk in parents)
+		if invalid:
+			from itertools import chain
 
-		if not query:  # TODO: Armour everywhere.
-			return None
+			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
+			for doc in chain(from_db, assets):
+				cache[str(doc.pk)] = doc
+				cache.children_calculated.add(doc.parent.pk)
+			found.extend(from_db)
 
-		return self.base_query(reduce(__or__, query)).order_by('parent', 'order')
+		return process_assets(found)
+
+
+	def _next_prev(self, filter_fn):
+		"""The sibling immediately following this asset."""
+		cache = ContentmentCache.get_cache()
+		assets = self.clone()
+
+		if cache is None:
+			return self._get_from_db(assets, filter_fn, order='path').first()
+
+		pks = set()
+		parents = set()
+		for asset in assets:
+			pks.add(asset.pk)
+			if asset.parent:
+				parents.add(asset.parent.pk)
+		found = [doc for doc in cache.values() if doc.parent and doc.pk not in pks and doc.parent.pk in parents]
+		invalid = any(pk not in cache.children_calculated for pk in parents)
+		if invalid:
+			from itertools import chain
+
+			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
+			for doc in chain(from_db, assets):
+				cache[str(doc.pk)] = doc
+				cache.children_calculated.add(doc.parent.pk)
+			found.extend(from_db)
+
+		return sorted(found, key=lambda it: it.path or '')[0]
 
 	@property
 	def next(self):
-		"""The sibling immediately following this asset."""
-		from operator import __or__
-		from functools import reduce
-
-		query = []
-
-		for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
-			query.append(Q(parent=parent, order=order + 1))
-
-		if not query:
-			return None
-
-		return self.base_query(reduce(__or__, query)).order_by('path').first()
+		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order + 1))
+		# for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
+		# 	query.append(Q(parent=parent, order=order + 1))
+		#
+		# if not query:
+		# 	return None
+		#
+		# return self.base_query(reduce(__or__, query)).order_by('path').first()
 
 	@property
 	def nextAll(self):
 		"""All siblings following this asset."""
-		from operator import __or__
-		from functools import reduce
+		cache = ContentmentCache.get_cache()
+		assets = self.clone()
+		filter_fn = lambda asset: Q(parent=asset.parent, order__gt=asset.order, pk__ne=asset.pk)
 
-		query = []
+		if cache is None:
+			return self._get_from_db(assets, filter_fn)
 
-		# Indexing note: (parent, order, id) for covered query and optimal re-use.
-		# Including id here to prevent an edge case (assets being shuffled) from including non-siblings.
-		for id, parent, order in self.clone().scalar('id', 'parent', 'order'):#.no_dereference():
-			query.append(Q(parent=parent, order__gt=order, id__ne=id))
 
-		if not query:
-			return None
+		pks = set()
+		parents = set()
+		for asset in assets:
+			pks.add(asset.pk)
+			if asset.parent:
+				parents.add(asset.parent.pk)
+		found = [doc for doc in cache.values() if doc.parent and doc.pk not in pks and doc.parent.pk in parents]
+		invalid = any(pk not in cache.children_calculated for pk in parents)
+		if invalid:
+			from itertools import chain
 
-		return self.base_query(reduce(__or__, query)).order_by('parent', 'order')
+			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
+			for doc in chain(from_db, assets):
+				cache[str(doc.pk)] = doc
+				cache.children_calculated.add(doc.parent.pk)
+			found.extend(from_db)
+
+		return process_assets(found)
+		# # Indexing note: (parent, order, id) for covered query and optimal re-use.
+		# # Including id here to prevent an edge case (assets being shuffled) from including non-siblings.
+		# for id, parent, order in self.clone().scalar('id', 'parent', 'order'):#.no_dereference():
+		# 	query.append(Q(parent=parent, order__gt=order, id__ne=id))
+		#
+		# if not query:
+		# 	return None
+		#
+		# return self.base_query(reduce(__or__, query)).order_by('parent', 'order')
 
 	@property
 	def prev(self):
+		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order - 1))
 		"""The sibling immediately preceeding this asset."""
-		from operator import __or__
-		from functools import reduce
-
-		query = []
-
-		for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
-			query.append(Q(parent=parent, order=order - 1))
-
-		if not query:
-			return None
-
-		return self.base_query(reduce(__or__, query)).order_by('parent').first()
+		# from operator import __or__
+		# from functools import reduce
+		#
+		# query = []
+		#
+		# for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
+		# 	query.append(Q(parent=parent, order=order - 1))
+		#
+		# if not query:
+		# 	return None
+		#
+		# return self.base_query(reduce(__or__, query)).order_by('parent').first()
 
 	@property
 	def prevAll(self):
@@ -520,10 +617,10 @@ class TaxonomyQuerySet(QuerySet):
 				obj.insert(-1, child)
 		return self
 
-	def get(self, *q_objs, **query):
-		model_id = str(query['id'])
-		getter = lambda: super(TaxonomyQuerySet, self).get(*q_objs, **query)
-		return get_from_cache(getter, model_id)
+	# def get(self, *q_objs, **query):
+	# 	model_id = str(query['id'])
+	# 	getter = lambda: super(TaxonomyQuerySet, self).get(*q_objs, **query)
+	# 	return get_from_cache(getter, model_id)
 
 
 class CustomDereferenceMixin(ComplexBaseField):
@@ -602,6 +699,25 @@ class Taxonomy(Document):
 	name = StringField(db_field='n', export=True, simple=True)
 	path = StringField(db_field='t_P', unique=True, export=True, simple=True)
 	order = IntField(db_field='t_o', default=0, export=True, simple=True)
+
+	# def __new__(cls, *args, **values):
+	# 	cache = ContentmentCache.get_cache()
+	# 	if cache is None:
+	# 		return object.__new__(cls, *args, **values)
+	#
+	# 	key = values.get(cls._meta.get('id_field'))
+	# 	key = str(key) or None
+	#
+	# 	import ipdb; ipdb.set_trace()
+	#
+	# 	if key is None or key not in cache:
+	# 		instance = object.__new__(cls, *args, **values)
+	# 		if instance.pk:
+	# 			print('Added to cache')
+	# 			cache[str(instance.pk)] = instance
+	# 		return instance
+	#
+	# 	return cache[key]
 
 	def __repr__(self):
 		return "{0.__class__.__name__} ({0.name}, {0.path})".format(self)

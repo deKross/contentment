@@ -39,6 +39,11 @@ class ContentmentExtension:
 
 
 class ContentmentCache(dict):
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.children_calculated = set()
+		self.contents_calculated = set()
+
 	@classmethod
 	def get_cache(cls):
 		import web.core
@@ -47,10 +52,10 @@ class ContentmentCache(dict):
 		except AttributeError:
 			return None
 
-	def __getitem__(self, key):
-		result = super().__getitem__(key)
-		print('From cache: %s' % result)
-		return result
+	# def __getitem__(self, key):
+	# 	result = super().__getitem__(key)
+	# 	print('From cache: %s' % result)
+	# 	return result
 
 
 class AssetCacheExtension:
