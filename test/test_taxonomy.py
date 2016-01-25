@@ -24,6 +24,12 @@ def root(connection):
 	return Asset.objects.get(path='/careers.illicohodes.com')
 
 
+@pytest.fixture(autouse=True)
+def contentment_cache():
+	from web.ext.contentment import AssetCacheExtension
+	AssetCacheExtension().before({})
+
+
 @pytest.fixture
 def models(connection):
 	from collections import namedtuple
@@ -44,12 +50,12 @@ class TModel(Taxonomy):
 @pytest.mark.usefixtures('connection')
 class TestTaxonomy:
 	def test_siblings(self, root):
-		assert root.children[1].siblings.count() == 5
+		assert len(root.children[1].siblings) == 5
 
 	def test_next(self, root):
 		subroot = root.children[0].children[1]
 		nexts = list(root.children[0].children[2:4])
-		assert subroot.nextAll.count() == 2
+		assert len(subroot.nextAll) == 2
 		assert list(subroot.nextAll) == nexts
 		c = subroot
 		count = 0
@@ -63,7 +69,7 @@ class TestTaxonomy:
 	def test_prev(self, root):
 		subroot = root.children[0].children[2]
 		prevs = list(root.children[0].children[0:2])
-		assert subroot.prevAll.count() == 2
+		assert len(subroot.prevAll) == 2
 		assert list(subroot.prevAll) == prevs
 		c = subroot
 		count = 0
@@ -75,7 +81,7 @@ class TestTaxonomy:
 		assert count == 2
 
 	def test_insert_detach(self, models):
-		assert models.parent.children.count() == 0
+		assert len(models.parent.children) == 0
 		assert models.child1.parents == []
 
 		models.parent.insert(0, models.child1)
@@ -143,5 +149,5 @@ class TestTaxonomy:
 
 		models.child2.replaceWith(replacer)
 		replacer.reload(-1)
-		assert models.parent.children.count() == 0
+		assert len(models.parent.children) == 0
 		assert replacer.name == 'child2'

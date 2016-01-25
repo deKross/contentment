@@ -45,10 +45,6 @@ def get_from_cache(getter, model_id):
 	return entry
 
 
-def process_assets(assets):
-	return sorted(assets, key=lambda it: (str(it.parent.id) if it.parent else '', it.order))
-
-
 class CustomDereference(DeReference):
 	def _find_references(self, items, depth=0, finded_ids=None):
 		"""
@@ -202,6 +198,20 @@ class TaxonomyQuerySet(QuerySet):
 	# 	print("Cursor")
 	# 	return super(TaxonomyQuerySet, self)._cursor
 
+	def process_assets(self, assets, sort_fn=None):
+		if sort_fn is None:
+			sort_fn = lambda it: (str(it.parent.id) if it.parent else '', it.order)
+		result = sorted(assets, key=sort_fn)
+		qs = self.base_query(pk__in=[asset.pk for asset in result])
+		qs._result_cache = result
+		qs._has_more = False
+		return qs
+
+	def _to_qs(self, data):
+		if isinstance(data, QuerySet):
+			return data
+		return self.base_query(pk__in=[asset.pk for asset in data])
+
 	def _get_from_db(self, assets, fn, exclude=None, order=('parent', 'order')):
 		from operator import __or__
 		from functools import reduce
@@ -269,6 +279,16 @@ class TaxonomyQuerySet(QuerySet):
 
 		# Optimization note: this doesn't need to worry about normalizing paths, thus the _from_doc_delete.
 		# TODO: Handle potential exception: signal handlers may preemptively delete included records. That's perfectly ok!
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			objs = list(self.base_query(parents__in=parents))
+			for obj in objs:
+				cache.pop(str(obj.pk), None)
+			objs.extend(parents)
+			for parent in objs:
+				key = parent.pk
+				if key in cache.children_calculated:
+					cache.children_calculated.remove(key)
 		self.base_query(parents__in=parents).delete(write_concern=None, _from_doc_delete=True)  # TODO: write_concern
 
 		# Returns original QuerySet, as it'll need to re-query to check if any included results survive.
@@ -288,7 +308,8 @@ class TaxonomyQuerySet(QuerySet):
 			_max = self.base_query(parent=parent).order_by('-order').scalar('order').first()
 			index = 0 if _max is None else (_max + 1)
 
-		q = self.base_query(parent=parent, order__gte=index).update(inc__order=1)
+		others = self.base_query(parent=parent, order__gte=index)
+		q = others.update(inc__order=1)
 
 		log.debug("before", extra=dict(data=repr(child._data)))
 
@@ -304,10 +325,31 @@ class TaxonomyQuerySet(QuerySet):
 		child = child.save()
 
 		print("Child contents:", child.contents)
-		child.contents.update(__raw__={'$push': {'t_a': {'$each': [i.to_dbref() for i in child.parents], '$position': 0}}})
+		result = child.contents.update(__raw__=
+			{'$push': {
+				't_a': {
+					'$each': [i.to_dbref() for i in child.parents],
+					'$position': 0
+				}
+			}},
+			full_result=True)
+
+		# import ipdb; ipdb.set_trace()
+
 		# child.contents.update(push__ancestors={'$each': ancestors, '$position': 0})  # Unimplemented.
 
 		parent._normpath(child.id)
+
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			key = parent.pk
+			if key in cache.children_calculated:
+				print('Invalidated: %s' % key)
+				cache.children_calculated.remove(key)
+			cache[str(key)] = parent
+			cache[str(child.pk)] = child
+			for other in others:
+				cache[str(other.pk)] = other
 
 		return self
 
@@ -323,8 +365,17 @@ class TaxonomyQuerySet(QuerySet):
 
 		self.nextAll.update(inc__order=-1)
 
-		self.contents.update(pull_all__parents=obj.parents)
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			objs = obj.parents
+			objs.extend(self.nextAll)
+			for asset in objs:
+				key = asset.pk
+				if key in cache.children_calculated:
+					print('Invalidated: %s' % key)
+					cache.children_calculated.remove(key)
 
+		result = self.contents.update(pull_all__parents=obj.parents, full_result=True)
 
 		obj.order = None
 		obj.path = obj.name
@@ -370,6 +421,9 @@ class TaxonomyQuerySet(QuerySet):
 		obj.path = target.path
 		obj.order = target.order
 
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			cache.pop(str(target.pk), None)
 		target.delete()
 		obj.save()
 
@@ -387,6 +441,9 @@ class TaxonomyQuerySet(QuerySet):
 		source.path = obj.path
 		source.order = obj.order
 
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			cache.pop(str(obj.pk), None)
 		obj.delete()
 		source.save()
 
@@ -436,7 +493,7 @@ class TaxonomyQuerySet(QuerySet):
 					cache[str(doc.id)] = doc
 					cache.children_calculated.add(doc.parent.id)
 			found.extend(from_db)
-		return process_assets(found)
+		return self.process_assets(found)
 
 	@property
 	def contents(self):
@@ -445,7 +502,7 @@ class TaxonomyQuerySet(QuerySet):
 		if cache is None:
 			return self.base_query(parents__in=self.clone().all()).order_by('parent', 'order')
 		pks = {pk for pk in self.clone().scalar('pk')}
-		found = [doc for doc in cache.values() if doc.parents and ({p.pk for p in doc.parents} & pks)]
+		found = [doc for doc in list(cache.values()) if doc.parents and ({p.pk for p in doc.parents} & pks)]
 		invalid = any(pk not in cache.contents_calculated for pk in pks)
 		if invalid:
 			from_db = self.base_query(parents__in=self.clone().all(), id__nin=[e.pk for e in found])#.order_by('parent', 'order')
@@ -456,7 +513,7 @@ class TaxonomyQuerySet(QuerySet):
 					cache.contents_calculated.add(doc.parent.pk)
 			found.extend(from_db)
 			cache.contents_calculated |= pks
-		return process_assets(found)
+		return self.process_assets(found)
 
 	@property
 	def siblings(self):
@@ -485,10 +542,10 @@ class TaxonomyQuerySet(QuerySet):
 				cache.children_calculated.add(doc.parent.pk)
 			found.extend(from_db)
 
-		return process_assets(found)
+		return self.process_assets(found)
 
 
-	def _next_prev(self, filter_fn):
+	def _next_prev(self, filter_fn, finder_fn):
 		"""The sibling immediately following this asset."""
 		cache = ContentmentCache.get_cache()
 		assets = self.clone()
@@ -498,33 +555,42 @@ class TaxonomyQuerySet(QuerySet):
 
 		pks = set()
 		parents = set()
+		orders = {}
 		for asset in assets:
 			pks.add(asset.pk)
 			if asset.parent:
 				parents.add(asset.parent.pk)
-		found = [doc for doc in cache.values() if doc.parent and doc.pk not in pks and doc.parent.pk in parents]
+				orders[asset.parent.pk] = asset.order
+
+		found = finder_fn(**locals())
 		invalid = any(pk not in cache.children_calculated for pk in parents)
 		if invalid:
 			from itertools import chain
 
-			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
+			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in chain(found, assets)])
 			for doc in chain(from_db, assets):
 				cache[str(doc.pk)] = doc
 				cache.children_calculated.add(doc.parent.pk)
 			found.extend(from_db)
 
-		return sorted(found, key=lambda it: it.path or '')[0]
+		try:
+			return sorted(found, key=lambda it: it.path or '')[0]
+		except IndexError:
+			return None
 
 	@property
 	def next(self):
-		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order + 1))
-		# for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
-		# 	query.append(Q(parent=parent, order=order + 1))
-		#
-		# if not query:
-		# 	return None
-		#
-		# return self.base_query(reduce(__or__, query)).order_by('path').first()
+		def finder(**kwargs):
+			cache = kwargs['cache']
+			pks = kwargs['pks']
+			parents = kwargs['parents']
+			orders = kwargs['orders']
+			return [doc for doc in cache.values()
+				 	if doc.parent
+				 	and doc.pk not in pks
+				 	and doc.parent.pk in parents
+				 	and doc.order == orders[doc.parent.pk] + 1]
+		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order + 1), finder)
 
 	@property
 	def nextAll(self):
@@ -536,14 +602,20 @@ class TaxonomyQuerySet(QuerySet):
 		if cache is None:
 			return self._get_from_db(assets, filter_fn)
 
-
 		pks = set()
 		parents = set()
+		orders = {}
 		for asset in assets:
 			pks.add(asset.pk)
 			if asset.parent:
 				parents.add(asset.parent.pk)
-		found = [doc for doc in cache.values() if doc.parent and doc.pk not in pks and doc.parent.pk in parents]
+				orders[asset.parent.pk] = asset.order
+
+		found = [doc for doc in cache.values()
+				 if doc.parent
+				 and doc.pk not in pks
+				 and doc.parent.pk in parents
+				 and doc.order > orders[doc.parent.pk]]
 		invalid = any(pk not in cache.children_calculated for pk in parents)
 		if invalid:
 			from itertools import chain
@@ -554,50 +626,58 @@ class TaxonomyQuerySet(QuerySet):
 				cache.children_calculated.add(doc.parent.pk)
 			found.extend(from_db)
 
-		return process_assets(found)
-		# # Indexing note: (parent, order, id) for covered query and optimal re-use.
-		# # Including id here to prevent an edge case (assets being shuffled) from including non-siblings.
-		# for id, parent, order in self.clone().scalar('id', 'parent', 'order'):#.no_dereference():
-		# 	query.append(Q(parent=parent, order__gt=order, id__ne=id))
-		#
-		# if not query:
-		# 	return None
-		#
-		# return self.base_query(reduce(__or__, query)).order_by('parent', 'order')
+		return self.process_assets(found)
 
 	@property
 	def prev(self):
-		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order - 1))
 		"""The sibling immediately preceeding this asset."""
-		# from operator import __or__
-		# from functools import reduce
-		#
-		# query = []
-		#
-		# for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
-		# 	query.append(Q(parent=parent, order=order - 1))
-		#
-		# if not query:
-		# 	return None
-		#
-		# return self.base_query(reduce(__or__, query)).order_by('parent').first()
+		def finder(**kwargs):
+			cache = kwargs['cache']
+			pks = kwargs['pks']
+			parents = kwargs['parents']
+			orders = kwargs['orders']
+			return [doc for doc in cache.values()
+				 	if doc.parent
+				 	and doc.pk not in pks
+				 	and doc.parent.pk in parents
+				 	and doc.order == orders[doc.parent.pk] - 1]
+		return self._next_prev(lambda asset: Q(parent=asset.parent, order=asset.order - 1), finder)
 
 	@property
 	def prevAll(self):
 		"""All siblings preceeding the selected assets."""
+		cache = ContentmentCache.get_cache()
+		assets = self.clone()
+		filter_fn = lambda asset: Q(parent=asset.parent, order__lt=asset.order, pk__ne=asset.pk)
 
-		from operator import __or__
-		from functools import reduce
+		if cache is None:
+			return self._get_from_db(assets, filter_fn)
 
-		query = []
+		pks = set()
+		parents = set()
+		orders = {}
+		for asset in assets:
+			pks.add(asset.pk)
+			if asset.parent:
+				parents.add(asset.parent.pk)
+				orders[asset.parent.pk] = asset.order
 
-		for parent, order in self.clone().scalar('parent', 'order'):#.no_dereference():
-			query.append(Q(parent=parent, order__lt=order))
+		found = [doc for doc in cache.values()
+				 if doc.parent
+				 and doc.pk not in pks
+				 and doc.parent.pk in parents
+				 and doc.order < orders[doc.parent.pk]]
+		invalid = any(pk not in cache.children_calculated for pk in parents)
+		if invalid:
+			from itertools import chain
 
-		if not query:
-			return None
+			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
+			for doc in chain(from_db, assets):
+				cache[str(doc.pk)] = doc
+				cache.children_calculated.add(doc.parent.pk)
+			found.extend(from_db)
 
-		return self.base_query(reduce(__or__, query)).order_by('parent', 'order')
+		return self.process_assets(found)
 
 	def contains(self, other):
 		"""The asset, specified by the parameter, is a descendant of any of the selected assets."""
@@ -607,6 +687,11 @@ class TaxonomyQuerySet(QuerySet):
 			assert isinstance(other, Asset) or isinstance(other, ObjectId), "Argument must be Asset or ObjectId instance."
 
 		parents = self.clone().scalar('id').no_dereference()
+		cache = ContentmentCache.get_cache()
+		if cache is None:
+			return bool(self.base_query(pk=getattr(other, 'pk', other), parents__in=parents).count())
+		if any(doc for doc in cache.values() if set(parents) & {(getattr(p, 'pk', None) or p.id) for p in doc.parents}):
+			return True
 		return bool(self.base_query(pk=getattr(other, 'pk', other), parents__in=parents).count())
 
 	def extend(self, *others):
@@ -721,6 +806,13 @@ class Taxonomy(Document):
 
 	def __repr__(self):
 		return "{0.__class__.__name__} ({0.name}, {0.path})".format(self)
+
+	def save(self, *args, **kwargs):
+		result = super(Taxonomy, self).save(*args, **kwargs)
+		cache = ContentmentCache.get_cache()
+		if cache is not None:
+			cache[str(result.pk)] = result
+		return result
 
 	@property
 	def _qs(self):
