@@ -283,12 +283,9 @@ class TaxonomyQuerySet(QuerySet):
 		if cache is not None:
 			objs = list(self.base_query(parents__in=parents))
 			for obj in objs:
-				cache.pop(str(obj.pk), None)
-			objs.extend(parents)
-			for parent in objs:
-				key = parent.pk
-				if key in cache.children_calculated:
-					cache.children_calculated.remove(key)
+				cache.remove(obj)
+			for parent in parents:
+				cache.invalidate(parent)
 		self.base_query(parents__in=parents).delete(write_concern=None, _from_doc_delete=True)  # TODO: write_concern
 
 		# Returns original QuerySet, as it'll need to re-query to check if any included results survive.
@@ -342,14 +339,10 @@ class TaxonomyQuerySet(QuerySet):
 
 		cache = ContentmentCache.get_cache()
 		if cache is not None:
-			key = parent.pk
-			if key in cache.children_calculated:
-				print('Invalidated: %s' % key)
-				cache.children_calculated.remove(key)
-			cache[str(key)] = parent
-			cache[str(child.pk)] = child
+			cache.invalidate(parent)
+			cache.store(child)
 			for other in others:
-				cache[str(other.pk)] = other
+				cache.store(other)
 
 		return self
 
@@ -370,12 +363,9 @@ class TaxonomyQuerySet(QuerySet):
 			objs = obj.parents
 			objs.extend(self.nextAll)
 			for asset in objs:
-				key = asset.pk
-				if key in cache.children_calculated:
-					print('Invalidated: %s' % key)
-					cache.children_calculated.remove(key)
+				cache.invalidate(asset)
 
-		result = self.contents.update(pull_all__parents=obj.parents, full_result=True)
+		self.contents.update(pull_all__parents=obj.parents)
 
 		obj.order = None
 		obj.path = obj.name
@@ -423,7 +413,7 @@ class TaxonomyQuerySet(QuerySet):
 
 		cache = ContentmentCache.get_cache()
 		if cache is not None:
-			cache.pop(str(target.pk), None)
+			cache.remove(target)
 		target.delete()
 		obj.save()
 
@@ -443,7 +433,7 @@ class TaxonomyQuerySet(QuerySet):
 
 		cache = ContentmentCache.get_cache()
 		if cache is not None:
-			cache.pop(str(obj.pk), None)
+			cache.remove(obj)
 		obj.delete()
 		source.save()
 
@@ -490,8 +480,7 @@ class TaxonomyQuerySet(QuerySet):
 			from_db = self.base_query(parent__in=self.clone(), id__nin=[e.id for e in found])#.order_by('parent', 'order')
 			if cache is not None:
 				for doc in from_db:
-					cache[str(doc.id)] = doc
-					cache.children_calculated.add(doc.parent.id)
+					cache.store(doc, children=True)
 			found.extend(from_db)
 		return self.process_assets(found)
 
@@ -509,8 +498,7 @@ class TaxonomyQuerySet(QuerySet):
 			print('From DB: %s' % len(from_db))
 			if cache is not None:
 				for doc in from_db:
-					cache[str(doc.pk)] = doc
-					cache.contents_calculated.add(doc.parent.pk)
+					cache.store(doc, content=True)
 			found.extend(from_db)
 			cache.contents_calculated |= pks
 		return self.process_assets(found)
@@ -538,12 +526,10 @@ class TaxonomyQuerySet(QuerySet):
 
 			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
 			for doc in chain(from_db, assets):
-				cache[str(doc.pk)] = doc
-				cache.children_calculated.add(doc.parent.pk)
+				cache.store(doc, children=True)
 			found.extend(from_db)
 
 		return self.process_assets(found)
-
 
 	def _next_prev(self, filter_fn, finder_fn):
 		"""The sibling immediately following this asset."""
@@ -569,8 +555,7 @@ class TaxonomyQuerySet(QuerySet):
 
 			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in chain(found, assets)])
 			for doc in chain(from_db, assets):
-				cache[str(doc.pk)] = doc
-				cache.children_calculated.add(doc.parent.pk)
+				cache.store(doc, children=True)
 			found.extend(from_db)
 
 		try:
@@ -622,8 +607,7 @@ class TaxonomyQuerySet(QuerySet):
 
 			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
 			for doc in chain(from_db, assets):
-				cache[str(doc.pk)] = doc
-				cache.children_calculated.add(doc.parent.pk)
+				cache.store(doc, children=True)
 			found.extend(from_db)
 
 		return self.process_assets(found)
@@ -673,8 +657,7 @@ class TaxonomyQuerySet(QuerySet):
 
 			from_db = self._get_from_db(assets, filter_fn, [str(doc.pk) for doc in found])
 			for doc in chain(from_db, assets):
-				cache[str(doc.pk)] = doc
-				cache.children_calculated.add(doc.parent.pk)
+				cache.store(doc, children=True)
 			found.extend(from_db)
 
 		return self.process_assets(found)
@@ -687,12 +670,22 @@ class TaxonomyQuerySet(QuerySet):
 			assert isinstance(other, Asset) or isinstance(other, ObjectId), "Argument must be Asset or ObjectId instance."
 
 		parents = self.clone().scalar('id').no_dereference()
+
 		cache = ContentmentCache.get_cache()
 		if cache is None:
 			return bool(self.base_query(pk=getattr(other, 'pk', other), parents__in=parents).count())
+
 		if any(doc for doc in cache.values() if set(parents) & {(getattr(p, 'pk', None) or p.id) for p in doc.parents}):
 			return True
-		return bool(self.base_query(pk=getattr(other, 'pk', other), parents__in=parents).count())
+
+		assets = self.base_query(pk=getattr(other, 'pk', other), parents__in=parents)
+		if not assets:
+			return False
+
+		for asset in assets:
+			cache.store(asset)
+
+		return True
 
 	def extend(self, *others):
 		"""Merge the contents of another asset or assets, specified by positional parameters, with this one."""

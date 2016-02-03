@@ -1,5 +1,7 @@
 # encoding: utf-8
 
+from mongoengine import Document
+
 from marrow.package.host import PluginManager
 
 
@@ -52,10 +54,32 @@ class ContentmentCache(dict):
 		except AttributeError:
 			return None
 
-	# def __getitem__(self, key):
-	# 	result = super().__getitem__(key)
-	# 	print('From cache: %s' % result)
-	# 	return result
+	def _invalidate_object(self, doc):
+		key = doc.pk
+		if key in self.children_calculated:
+			self.children_calculated.remove(key)
+		if key in self.contents_calculated:
+			self.contents_calculated.remove(key)
+
+	def invalidate(self, doc):
+		self[str(doc.pk)] = doc
+		self._invalidate_object(doc)
+		for parent in doc.parents:
+			self._invalidate_object(parent)
+
+	def store(self, doc, children=False, content=False):
+		self[str(doc.pk)] = doc
+		if doc.parent:
+			if children:
+				self.children_calculated.add(doc.parent.pk)
+			if content:
+				self.contents_calculated.add(doc.parent.pk)
+
+	def remove(self, doc):
+		self.pop(str(doc.pk), None)
+		self._invalidate_object(doc)
+		for parent in doc.parents:
+			self._invalidate_object(parent)
 
 
 class AssetCacheExtension:
