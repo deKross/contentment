@@ -40,11 +40,25 @@ class ContentmentExtension:
 		context.domain, _, _ = context.request.host.partition(':')
 
 
-class ContentmentCache(dict):
+class Singleton(type):
+	_instances = {}
+	def __call__(cls, *args, **kwargs):
+		if cls not in cls._instances:
+			cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+		return cls._instances[cls]
+
+
+class ContentmentCache(dict, metaclass=Singleton):
+	ATTR_NAME = '_contentment_cache'
+
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		self.children_calculated = set()
 		self.contents_calculated = set()
+
+		from web.core import local
+
+		setattr(local, self.ATTR_NAME, self)
 
 	@classmethod
 	def get_cache(cls):
@@ -81,10 +95,14 @@ class ContentmentCache(dict):
 		for parent in doc.parents:
 			self._invalidate_object(parent)
 
+	def clear(self):
+		super().clear()
+		self.children_calculated.clear()
+		self.contents_calculated.clear()
+
 
 class AssetCacheExtension:
 	needs = ['threadlocal']
 
 	def before(self, context):
-		from web.core import local
-		local.asset_cache = ContentmentCache()
+		ContentmentCache().clear()
