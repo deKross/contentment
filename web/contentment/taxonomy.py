@@ -184,6 +184,18 @@ class ReferenceField(BaseReferenceField):
 		return super(ReferenceField, self).__get__(instance, owner)
 
 
+def _get_field_from_db(asset, field):
+	pk = asset._fields.get(asset._meta.get('id_field'))
+	if pk is None:
+		return None
+
+	field_obj = asset._fields.get(field)
+	if field_obj is None:
+		raise ValueError('Invalid field name: %s' % field)
+
+	return asset._collection.find_one({pk.db_field: asset.pk})[field_obj.db_field]
+
+
 class TaxonomyQuerySet(QuerySet):
 	def __init__(self, document, collection, _rewrite_initial=False):
 		super(TaxonomyQuerySet, self).__init__(document, collection)
@@ -304,7 +316,7 @@ class TaxonomyQuerySet(QuerySet):
 			index = 0 if _max is None else (_max + 1)
 
 		others = self.base_query(parent=parent, order__gte=index)
-		q = others.update(inc__order=1)
+		others.update(inc__order=1)
 
 		log.debug("before", extra=dict(data=repr(child._data)))
 
@@ -339,6 +351,7 @@ class TaxonomyQuerySet(QuerySet):
 		cache.invalidate(parent)
 		cache.store(child)
 		for other in others:
+			other.order = _get_field_from_db(other, 'order')
 			cache.store(other)
 
 		return self
@@ -353,11 +366,16 @@ class TaxonomyQuerySet(QuerySet):
 
 		log.warn("Detaching from taxonomy." + "\n\t" + __import__('json').dumps(dict(asset=repr(obj), path=path)))
 
-		self.nextAll.update(inc__order=-1)
-
 		cache = ContentmentCache()
+
+		next_all = self.nextAll
+		next_all.update(inc__order=-1)
+		for asset in next_all:
+			asset.order = _get_field_from_db(asset, 'order')
+			cache.store(asset)
+
 		objs = obj.parents
-		objs.extend(self.nextAll)
+		objs.extend(next_all)
 		for asset in objs:
 			cache.invalidate(asset)
 
