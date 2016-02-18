@@ -22,9 +22,14 @@ log = __import__('logging').getLogger(__name__)
 
 class CacheableQuerySet(QuerySet):
 	def __init__(self, document, collection):
-		super().__init__(document, collection)
+		super(CacheableQuerySet, self).__init__(document, collection)
 		self._cache_iterator = None
 		self._count = collection.count()
+		self._db_will_be_queried = True
+
+	@property
+	def _db_query_required(self):
+		return len(ContentmentCache()) < self._count
 
 	@staticmethod
 	def _search_in_cache(query):
@@ -59,34 +64,91 @@ class CacheableQuerySet(QuerySet):
 			print('From cache: %s' % len(result))
 		return result
 
-	def _populate_cache(self):
-		if not self._result_cache:
-			self._result_cache = self._search_in_cache(self._query_obj.query)
+	def _super_populate_cache(self):
+		"""
+		Populates the result cache with ``ITER_CHUNK_SIZE`` more entries
+		(until the cursor is exhausted).
+		"""
+		from mongoengine.queryset.queryset import ITER_CHUNK_SIZE
 
-		if not self._result_cache or len(self._result_cache) < self._count:
-			print(len(self._result_cache))
-			super()._populate_cache()
-			print(len(self._result_cache))
+		if self._result_cache is None:
+			self._result_cache = []
+		if self._has_more:
+			try:
+				for i in range(ITER_CHUNK_SIZE):
+					entry = super(CacheableQuerySet, self).__next__()
+					if entry not in self._result_cache:
+						self._result_cache.append(entry)
+			except StopIteration:
+				self._has_more = False
+
+	def __call__(self, q_obj=None, class_check=True, read_preference=None, **query):
+		if not self._db_query_required:
+			self._db_will_be_queried = False
+		return super(CacheableQuerySet, self).__call__(q_obj, class_check, read_preference, **query)
+
+	def clone(self):
+		result = super(CacheableQuerySet, self).clone()
+		result._db_will_be_queried = self._db_will_be_queried
+		return result
+
+	def _populate_cache(self):
+		if self._db_query_required:
+			self._super_populate_cache()
 			for entry in self:
 				if entry is not None:
 					ContentmentCache().store(entry)
 		else:
+			self._result_cache = self._search_in_cache(self._query_obj.query)
 			self._has_more = False
 
-	def __next__(self):
+	def next(self):
+		if self._db_will_be_queried:
+			result = super(CacheableQuerySet, self).__next__()
+			if isinstance(result, Document):
+				ContentmentCache().store(result)
+			return result
 		if self._cache_iterator is None:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
 			self._cache_iterator = iter(self._result_cache)
 		try:
-			next(self._cache_iterator)
+			return next(self._cache_iterator)
 		except StopIteration:
 			result = super(CacheableQuerySet, self).__next__()
 			if isinstance(result, Document):
 				ContentmentCache().store(result)
 			return result
 
-	def _get_order_by(self, keys):
-		return super()._get_order_by(keys)
+	__next__ = next
+
+	def order_by(self, *keys):
+		def _get_order_tuple(doc):
+			from mongoengine.fields import IntField, FloatField, DecimalField, StringField, BooleanField
+			from decimal import Decimal
+
+			DEFAULTS = {
+				IntField: 0,
+				FloatField: 0.0,
+				DecimalField: Decimal(0),
+				StringField: '',
+				BooleanField: False,
+			}
+			return tuple(
+				(getattr(doc, key) or DEFAULTS.get(doc._fields[key]))
+				for key in keys
+			)
+
+		if not self._db_will_be_queried:
+			print('Sorted cache')
+			result = list(self)
+			result.sort(key=_get_order_tuple)
+			queryset = self.clone()
+			queryset._result_cache = result
+			queryset._has_more = self._has_more
+			return queryset
+
+		else:
+			return super(CacheableQuerySet, self).order_by(*keys)
 
 
 @signal(pre_delete)
