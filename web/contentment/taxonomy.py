@@ -34,20 +34,40 @@ class CacheableQuerySet(QuerySet):
 	@staticmethod
 	def _search_in_cache(query):
 		def exact_handler(entry, field, value):
-			return entry._data.get(field) == value
+			return getattr(entry, field) == value
+
+		def ne_handler(entry, field, value):
+			return not exact_handler(entry, field, value)
 
 		def in_handler(entry, field, value):
 			if isinstance(entry._fields.get(field), ListField):
-				return set(entry._data.get(field, [])) & (set(value) if value else {})
-			return entry._data.get(field, []) in (value if value is not None else [])
+				return set(getattr(entry, field, [])) & (set(value) if value else {})
+			return getattr(entry, field, []) in (value if value is not None else [])
 
 		def nin_handler(entry, field, value):
 			return not in_handler(entry, field, value)
 
+		def gt_handler(entry, field, value):
+			return getattr(entry, field) > value
+
+		def gte_handler(entry, field, value):
+			return getattr(entry, field) >= value
+
+		def lt_handler(entry, field, value):
+			return getattr(entry, field) < value
+
+		def lte_handler(entry, field, value):
+			return getattr(entry, field) <= value
+
 		HANDLERS = {
 			'exact': exact_handler,
+			'ne': ne_handler,
 			'in': in_handler,
 			'nin': nin_handler,
+			'gt': gt_handler,
+			'gte': gte_handler,
+			'lt': lt_handler,
+			'lte': lte_handler,
 		}
 
 		result = list(ContentmentCache().values())
@@ -96,7 +116,7 @@ class CacheableQuerySet(QuerySet):
 		if self._db_query_required:
 			self._super_populate_cache()
 			for entry in self:
-				if entry is not None:
+				if isinstance(entry, Document):
 					ContentmentCache().store(entry)
 		else:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
@@ -111,20 +131,18 @@ class CacheableQuerySet(QuerySet):
 		if self._cache_iterator is None:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
 			self._cache_iterator = iter(self._result_cache)
-		try:
-			return next(self._cache_iterator)
-		except StopIteration:
-			result = super(CacheableQuerySet, self).__next__()
-			if isinstance(result, Document):
-				ContentmentCache().store(result)
-			return result
+		result = next(self._cache_iterator)
+		if self._scalar:
+			return self._get_scalar(result)
+		return result
 
 	__next__ = next
 
 	def order_by(self, *keys):
 		def _get_order_tuple(doc):
-			from mongoengine.fields import IntField, FloatField, DecimalField, StringField, BooleanField
+			from mongoengine.fields import IntField, FloatField, DecimalField, StringField, BooleanField, ReferenceField
 			from decimal import Decimal
+			from bson.objectid import ObjectId
 
 			DEFAULTS = {
 				IntField: 0,
@@ -132,23 +150,88 @@ class CacheableQuerySet(QuerySet):
 				DecimalField: Decimal(0),
 				StringField: '',
 				BooleanField: False,
+				ReferenceField: ObjectId('0' * 24),
 			}
-			return tuple(
-				(getattr(doc, key) or DEFAULTS.get(doc._fields[key]))
-				for key in keys
-			)
+
+			result = []
+
+			for key in keys:
+				attr = getattr(doc, key)
+				if isinstance(attr, Document):
+					result.append(attr.pk)
+				elif attr is None:
+					result.append(DEFAULTS.get(type(doc._fields[key])))
+				else:
+					result.append(attr)
+
+			return tuple(result)
 
 		if not self._db_will_be_queried:
 			print('Sorted cache')
+			reverse = False
+			keys = list(keys)
+			for i in range(len(keys)):
+				key = keys[i]
+				if key.startswith('-'):
+					reverse = True
+					keys[i] = key[1:]
 			result = list(self)
-			result.sort(key=_get_order_tuple)
+			result.sort(key=_get_order_tuple, reverse=reverse)
 			queryset = self.clone()
 			queryset._result_cache = result
 			queryset._has_more = self._has_more
+			self.rewind()
 			return queryset
 
 		else:
 			return super(CacheableQuerySet, self).order_by(*keys)
+
+	def _update_in_cache(self, docs, update):
+		def inc_handler(entry, field, value):
+			setattr(entry, field, getattr(entry, field) + 1)
+
+		def set_handler(entry, field, value):
+			setattr(entry, field, value)
+
+		def pull_all_handler(entry, field, value):
+			setattr(entry, field, [item for item in getattr(entry, field) if item not in set(value)])
+
+		if '__raw__' in update:
+			[ContentmentCache().store(doc.reload()) for doc in docs]
+			return
+
+		HANDLERS = {
+			'inc': inc_handler,
+			'set': set_handler,
+			'pull_all': pull_all_handler,
+		}
+
+		from functools import partial
+
+		updaters = []
+
+		for part, value in update.items():
+			part = part.split('__', 1)
+			if len(part) < 2:
+				continue
+			op, field = part
+			updaters.append(partial(HANDLERS.get(op), field=field, value=value))
+
+		for doc in docs:
+			[updater(doc) for updater in updaters]
+
+	def update(self, upsert=False, multi=True, write_concern=None, full_result=False, **update):
+		self._update_in_cache(self._search_in_cache(self._query_obj.query), update)
+		return super(CacheableQuerySet, self).update(upsert, multi, write_concern, full_result, **update)
+
+	def update_one(self, upsert=False, write_concern=None, **update):
+		self._update_in_cache([self._search_in_cache(self._query_obj.query)[0]], update)
+		return super(CacheableQuerySet, self).update_one(upsert, write_concern, **update)
+
+	def delete(self, write_concern=None, _from_doc_delete=False, cascade_refs=None):
+		for doc in self._search_in_cache(self._query_obj.query):
+			ContentmentCache().remove(doc)
+		return super(CacheableQuerySet, self).delete(write_concern, _from_doc_delete, cascade_refs)
 
 
 @signal(pre_delete)
