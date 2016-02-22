@@ -120,6 +120,8 @@ class CacheableQuerySet(QuerySet):
 					ContentmentCache().store(entry)
 		else:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
+			if self._scalar:
+				self._result_cache = [self._get_scalar(doc) for doc in self._result_cache]
 			self._has_more = False
 
 	def next(self):
@@ -128,17 +130,19 @@ class CacheableQuerySet(QuerySet):
 			if isinstance(result, Document):
 				ContentmentCache().store(result)
 			return result
+
 		if self._cache_iterator is None:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
+
 			self._cache_iterator = iter(self._result_cache)
+
 		result = next(self._cache_iterator)
-		if self._scalar:
-			return self._get_scalar(result)
 		return result
 
 	__next__ = next
 
 	def order_by(self, *keys):
+
 		def _get_order_tuple(doc):
 			from mongoengine.fields import IntField, FloatField, DecimalField, StringField, BooleanField, ReferenceField
 			from decimal import Decimal
@@ -188,7 +192,7 @@ class CacheableQuerySet(QuerySet):
 
 	def _update_in_cache(self, docs, update):
 		def inc_handler(entry, field, value):
-			setattr(entry, field, getattr(entry, field) + 1)
+			setattr(entry, field, getattr(entry, field) + value)
 
 		def set_handler(entry, field, value):
 			setattr(entry, field, value)
