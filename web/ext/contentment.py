@@ -60,6 +60,9 @@ class ContentmentCache(dict, metaclass=Singleton):
 
 		setattr(local, self.ATTR_NAME, self)
 
+		# self.counts = {}
+		self.queries = set()
+
 	@classmethod
 	def get_cache(cls):
 		import web.core
@@ -67,6 +70,9 @@ class ContentmentCache(dict, metaclass=Singleton):
 			return web.core.local.asset_cache
 		except AttributeError:
 			return None
+
+	def get_count(self, cls):
+		return self.counts.get(cls, 0)
 
 	def _invalidate_object(self, doc):
 		key = doc.pk
@@ -95,13 +101,24 @@ class ContentmentCache(dict, metaclass=Singleton):
 		for parent in doc.parents:
 			self._invalidate_object(parent)
 
+	def store_queryset(self, queryset):
+		self.queries.add(str(queryset._query))
+
+	def check_queryset(self, queryset):
+		return str(queryset._query) in self.queries
+
 	def clear(self):
+		# from web.contentment.taxonomy import Taxonomy
+
 		super().clear()
 		self.children_calculated.clear()
 		self.contents_calculated.clear()
+		self.queries.clear()
+		# collections = {e._collection.name: e._collection for e in Taxonomy.__subclasses__()}
+		# self.counts = {name: collection.count() for name, collection in collections.items()}
 
 
-class AssetCacheExtension:
+class ContentmentCacheExtension:
 	needs = ['threadlocal']
 
 	def before(self, context):
