@@ -63,6 +63,11 @@ class ContentmentCache(dict, metaclass=Singleton):
 		# self.counts = {}
 		self.queries = set()
 
+	def __contains__(self, item):
+		if isinstance(item, Document):
+			item = str(item.pk)
+		return super(ContentmentCache, self).__contains__(item)
+
 	@classmethod
 	def get_cache(cls):
 		import web.core

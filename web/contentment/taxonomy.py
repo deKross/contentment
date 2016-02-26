@@ -24,7 +24,6 @@ class CacheableQuerySet(QuerySet):
 	def __init__(self, document, collection):
 		super(CacheableQuerySet, self).__init__(document, collection)
 		self._cache_iterator = None
-		# self._count = collection.count()
 		self.__db_query_required = None
 
 	@property
@@ -34,10 +33,6 @@ class CacheableQuerySet(QuerySet):
 
 		self.__db_query_required = not ContentmentCache().check_queryset(self)
 		return self.__db_query_required
-		# col_name = self._collection.name
-		# cache_sum = sum(col_name == e._get_collection_name() for e in ContentmentCache().values())
-		# self.__db_query_required = cache_sum < ContentmentCache().get_count(col_name)
-		# return self.__db_query_required
 
 	@staticmethod
 	def _search_in_cache(query):
@@ -87,10 +82,7 @@ class CacheableQuerySet(QuerySet):
 			else:
 				field = field[0]
 				op = 'exact'
-			# print(field, op, value)
 			result = [entry for entry in result if HANDLERS.get(op)(entry, field, value)]
-		# if result:
-		# 	print('From cache: %s' % len(result))
 		return result
 
 	def _super_populate_cache(self):
@@ -111,29 +103,38 @@ class CacheableQuerySet(QuerySet):
 			except StopIteration:
 				self._has_more = False
 
-	# def __call__(self, q_obj=None, class_check=True, read_preference=None, **query):
-	# 	if not self._db_query_required:
-	# 		self._db_will_be_queried = False
-	# 	return super(CacheableQuerySet, self).__call__(q_obj, class_check, read_preference, **query)
-
-	def clone(self):
-		result = super(CacheableQuerySet, self).clone()
-		result.__db_query_required = self.__db_query_required
-		return result
-
 	def _populate_cache(self):
+		if self._result_cache:
+			return
+
 		if self._db_query_required:
 			self._super_populate_cache()
 			for entry in self:
 				if isinstance(entry, Document):
 					ContentmentCache().store(entry)
-			# print("From DB")
 			ContentmentCache().store_queryset(self)
+
 		else:
 			self._result_cache = self._search_in_cache(self._query_obj.query)
 			if self._scalar:
 				self._result_cache = [self._get_scalar(doc) for doc in self._result_cache]
 			self._has_more = False
+
+	def get(self, *q_objs, **query):
+		result = self._search_in_cache(self.clone().filter(*q_objs, **query)._query_obj.query)
+		if not result:
+			return super().get(*q_objs, **query)
+
+		if len(result) > 1:
+			message = '%d items returned, instead of 1' % len(result)
+			raise self._document.MultipleObjectsReturned(message)
+
+		return result[0]
+
+	def clone(self):
+		result = super(CacheableQuerySet, self).clone()
+		result.__db_query_required = self.__db_query_required
+		return result
 
 	def next(self):
 		if self._db_query_required:
@@ -143,7 +144,8 @@ class CacheableQuerySet(QuerySet):
 			return result
 
 		if self._cache_iterator is None:
-			self._result_cache = self._search_in_cache(self._query_obj.query)
+			if not self._result_cache:
+				self._result_cache = self._search_in_cache(self._query_obj.query)
 
 			self._cache_iterator = iter(self._result_cache)
 
@@ -185,25 +187,22 @@ class CacheableQuerySet(QuerySet):
 
 			return tuple(result)
 
-		if not self._db_query_required:
-			# print('Sorted cache')
-			reverse = False
-			keys = list(keys)
-			for i in range(len(keys)):
-				key = keys[i]
-				if key.startswith('-'):
-					reverse = True
-					keys[i] = key[1:]
-			result = list(self)
-			result.sort(key=_get_order_tuple, reverse=reverse)
-			queryset = self.clone()
-			queryset._result_cache = result
-			queryset._has_more = self._has_more
-			queryset.rewind()
-			return queryset
-
-		else:
+		if self._db_query_required:
 			return super(CacheableQuerySet, self).order_by(*keys)
+
+		reverse = False
+		keys = list(keys)
+		for i in range(len(keys)):
+			key = keys[i]
+			if key.startswith('-'):
+				reverse = True
+				keys[i] = key[1:]
+
+		queryset = self.clone()
+		queryset._result_cache = sorted(list(self), key=_get_order_tuple, reverse=reverse)
+		queryset._has_more = self._has_more
+		queryset.rewind()
+		return queryset
 
 	def _update_in_cache(self, docs, update):
 		def inc_handler(entry, field, value):
@@ -240,12 +239,15 @@ class CacheableQuerySet(QuerySet):
 			[updater(doc) for updater in updaters]
 
 	def update(self, upsert=False, multi=True, write_concern=None, full_result=False, **update):
-		self._update_in_cache(self._search_in_cache(self._query_obj.query), update)
+		# if not multi:
+		# 	import ipdb; ipdb.set_trace()
+		if multi:
+			docs = self._search_in_cache(self._query_obj.query)
+		else:
+			docs = [self._result_cache[0]] if self._result_cache else []
+		if docs:
+			self._update_in_cache(docs, update)
 		return super(CacheableQuerySet, self).update(upsert, multi, write_concern, full_result, **update)
-
-	def update_one(self, upsert=False, write_concern=None, **update):
-		self._update_in_cache([self._search_in_cache(self._query_obj.query)[0]], update)
-		return super(CacheableQuerySet, self).update_one(upsert, write_concern, **update)
 
 	def delete(self, write_concern=None, _from_doc_delete=False, cascade_refs=None):
 		for doc in self._search_in_cache(self._query_obj.query):
